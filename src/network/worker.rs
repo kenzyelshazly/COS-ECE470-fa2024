@@ -44,16 +44,64 @@ impl Worker {
     }
 
     fn worker_loop(&self) {
+        let mut buffer = Vec::new()
         loop {
             let result = smol::block_on(self.msg_chan.recv());
             if let Err(e) = result {
                 error!("network worker terminated {}", e);
                 break;
             }
-            let msg = result.unwrap();
-            let (msg, mut peer) = msg;
-            let msg: Message = bincode::deserialize(&msg).unwrap();
+            let (msg_bytes, mut peer) = result.unwrap();
+            let msg: Message = match bincode::deserialize(&msg_bytes){
+                Ok(m) => m,
+                Err(e) => {
+                    error!("Failed to deserialize message: {}", e);
+                    continue;
+                },
+            };
+
             match msg {
+                Message::NewBlockHashes(hashes) => {
+                    let missing_hashes: Vec<_> = hashes.iter()
+                        .filter(|hash| !self.server.has_block(hash))
+                        .cloned()
+                        .collect();
+                    if !missing_hashes.is_empty() {
+                        peer.write(Message::GetBlocks(missing_hashes)).unwrap();
+                    }
+                },
+                Message::GetBlocks(hashes) => {
+                    let blocks: Vec<_> = hashes.iter()
+                        .filter_map(|hash| self.server.get_block(hash))
+                        .collect();
+                    if !blocks.is_empty() {
+                        peer.write(Message::Blocks(blocks)).unwrap();
+                    }
+                },
+                Message::Blocks(new_blocks) => {
+                    let mut new_hashes = Vec::new();
+
+                    for block in new_blocks {
+                        if !self.server.insert_block(&block) {
+                            continue;
+                        }
+                        new_hashes.push(block.hash());
+
+                        if let Some(parent_hash) = block.parent_hash() {
+                            buffer.retain(|b| {
+                                if b.parent_hash() == Some(parent_hash) {
+                                    self.server.insert_block(b);
+                                    false
+                                } else {
+                                    true
+                                }
+                            });
+                        }
+                    }
+                    if !new_hashes.is_empty() {
+                        self.server.broadcast(Message::NewBlockHashes(new_hashes)).unwrap();
+                    }
+                },
                 Message::Ping(nonce) => {
                     debug!("Ping: {}", nonce);
                     peer.write(Message::Pong(nonce.to_string()));
@@ -89,10 +137,19 @@ impl TestMsgSender {
 /// returns two structs used by tests, and an ordered vector of hashes of all blocks in the blockchain
 fn generate_test_worker_and_start() -> (TestMsgSender, ServerTestReceiver, Vec<H256>) {
     let (server, server_receiver) = ServerHandle::new_for_test();
+
+    let mut blockchain = server.get_blockchain();
+    let genesis_block = blockchain.create_genesis_block();
+    blockchain.add_block(genesis_block.clone());
+
     let (test_msg_sender, msg_chan) = TestMsgSender::new();
+
     let worker = Worker::new(1, msg_chan, &server);
     worker.start(); 
-    (test_msg_sender, server_receiver, vec![])
+
+    let block_hashes = blockchain.longest_chain_hashes(); 
+
+    (test_msg_sender, server_receiver, block_hashes)
 }
 
 // DO NOT CHANGE THIS COMMENT, IT IS FOR AUTOGRADER. BEFORE TEST
